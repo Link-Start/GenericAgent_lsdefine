@@ -1,7 +1,7 @@
 import sys, os, re, json, time, threading, importlib
 from datetime import datetime
 from pathlib import Path
-import tempfile, traceback, subprocess, itertools, collections, difflib
+import tempfile, traceback, subprocess, itertools, collections, difflib, shutil
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -9,7 +9,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agent_loop import BaseHandler, StepOutcome, json_default
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None):
+def safe_print(*args, **kwargs):
+    try: print(*args, **kwargs)
+    except: pass
+
+def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None, maxlen=10000, myprint=safe_print):
     """代码执行器
     python: 运行复杂的 .py 脚本（文件模式）
     powershell/bash: 运行单行指令（命令模式）
@@ -26,11 +30,14 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         tmp_file.close()
         cmd = [sys.executable, "-X", "utf8", "-u", tmp_path]   
     elif code_type in ["powershell", "bash", "sh", "shell", "ps1", "pwsh"]:
-        if os.name == 'nt': cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
+        if os.name == 'nt':
+            _ps = "pwsh" if shutil.which("pwsh") else "powershell"
+            utf8_prefix = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            cmd = [_ps, "-NoProfile", "-NonInteractive", "-Command", utf8_prefix + code]
         else: cmd = ["bash", "-c", code]
     else:
         return {"status": "error", "msg": f"不支持的类型: {code_type}"}
-    print("code run output:") 
+    myprint("code run output:")
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
@@ -44,8 +51,7 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
                 try: line = line_bytes.decode('utf-8')
                 except UnicodeDecodeError: line = line_bytes.decode('gbk', errors='ignore')
                 logs.append(line)
-                try: print(line, end="") 
-                except: pass
+                myprint(line, end="")
         except: pass
 
     try:
@@ -62,7 +68,7 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
             istimeout = time.time() - start_t > timeout
             if istimeout or stop_signal:
                 process.kill()
-                print("[Debug] Process killed due to timeout or stop signal.")
+                myprint("[Debug] Process killed due to timeout or stop signal.")
                 if istimeout: full_stdout.append("\n[Timeout Error] 超时强制终止")
                 else: full_stdout.append("\n[Stopped] 用户强制终止")
                 break
@@ -81,7 +87,7 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         if process.stdout: threading.Thread(target=process.stdout.close, daemon=True).start()
         return {
             "status": status,
-            "stdout": smart_format(stdout_str, max_str_len=10000, omit_str='\n\n[omitted long output]\n\n'),
+            "stdout": smart_format(stdout_str, max_str_len=maxlen, omit_str='\n\n[omitted long output]\n\n'),
             "exit_code": exit_code
         }
     except Exception as e:
@@ -111,7 +117,7 @@ def first_init_driver():
         #driver.newtab()
         time.sleep(3)
 
-def web_scan(tabs_only=False, switch_tab_id=None, text_only=False):
+def web_scan(tabs_only=False, switch_tab_id=None, text_only=False, maxlen=35000):
     """获取当前页面的简化HTML内容和标签页列表。注意：简化过程会过滤边栏、浮动元素等非主体内容。
     tabs_only: 仅返回标签页列表，不获取HTML内容（节省token）。
     switch_tab_id: 可选参数，如果提供，则在扫描前切换到该标签页。
@@ -136,8 +142,8 @@ def web_scan(tabs_only=False, switch_tab_id=None, text_only=False):
             }
         }
         if not tabs_only: 
-            importlib.reload(simphtml); result["content"] = simphtml.get_html(driver, cutlist=True, maxchars=35000, text_only=text_only)
-            if text_only: result['content'] = smart_format(result['content'], max_str_len=10000, omit_str='\n\n[omitted long content]\n\n')
+            importlib.reload(simphtml); result["content"] = simphtml.get_html(driver, cutlist=True, maxchars=maxlen, text_only=text_only)
+            if text_only: result['content'] = smart_format(result['content'], max_str_len=maxlen//3, omit_str='\n\n[omitted long content]\n\n')
         return result
     except Exception as e:
         return {"status": "error", "msg": format_error(e)}
@@ -268,6 +274,7 @@ class GenericAgentHandler(BaseHandler):
         self.history_info = last_history if last_history else []
         self.code_stop_signal = []
         self._done_hooks = []
+        self.print = safe_print
 
     def _get_abs_path(self, path):
         if not path: return ""
@@ -290,6 +297,7 @@ class GenericAgentHandler(BaseHandler):
         raw_path = os.path.join(self.cwd, args.get("cwd", './'))
         cwd = os.path.normpath(os.path.abspath(raw_path))
         code_cwd = os.path.normpath(self.cwd)
+        maxlen = 10000 // args.get('_tool_num', 1)
         if code_type == 'python' and args.get("inline_eval"):
             ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
             old_cwd = os.getcwd()
@@ -300,7 +308,7 @@ class GenericAgentHandler(BaseHandler):
                     except SyntaxError: exec(code, ns); result = ns.get('_r', 'OK')
                 except Exception as e: result = f'Error: {e}'
             finally: os.chdir(old_cwd)
-        else: result = yield from code_run(code, code_type, timeout, cwd, code_cwd=code_cwd, stop_signal=self.code_stop_signal)
+        else: result = yield from code_run(code, code_type, timeout, cwd, code_cwd=code_cwd, stop_signal=self.code_stop_signal, maxlen=maxlen, myprint=self.print)
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         return StepOutcome(result, next_prompt=next_prompt)
     
@@ -318,7 +326,8 @@ class GenericAgentHandler(BaseHandler):
         tabs_only = args.get("tabs_only", False)
         switch_tab_id = args.get("switch_tab_id", None)
         text_only = args.get("text_only", False)
-        result = web_scan(tabs_only=tabs_only, switch_tab_id=switch_tab_id, text_only=text_only)
+        maxlen = 35000 // args.get('_tool_num', 1)
+        result = web_scan(tabs_only=tabs_only, switch_tab_id=switch_tab_id, text_only=text_only, maxlen=maxlen)
         content = result.pop("content", None)
         yield f'[Info] {str(result)}\n'
         if content: result = json.dumps(result, ensure_ascii=False, default=json_default) + f"\n```html\n{content}\n```"
@@ -343,15 +352,14 @@ class GenericAgentHandler(BaseHandler):
             try:
                 with open(abs_path, 'w', encoding='utf-8') as f: f.write(str(content))
                 result["js_return"] += f"\n\n[已保存完整内容到 {abs_path}]"
-            except:
-                result['js_return'] += f"\n\n[保存失败，无法写入文件 {abs_path}]"
+            except: result['js_return'] += f"\n\n[保存失败，无法写入文件 {abs_path}]"
         show = smart_format(json.dumps(result, ensure_ascii=False, indent=2, default=json_default), max_str_len=300)
-        try: print("Web Execute JS Result:", show)
-        except: pass
+        self.print("Web Execute JS Result:", show)
         yield f"JS 执行结果:\n{show}\n"
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         result = json.dumps(result, ensure_ascii=False, default=json_default)
-        return StepOutcome(smart_format(result, max_str_len=8000), next_prompt=next_prompt)
+        maxlen = 8000 // args.get('_tool_num', 1)
+        return StepOutcome(smart_format(result, max_str_len=maxlen), next_prompt=next_prompt)
     
     def do_file_patch(self, args, response):
         path = self._get_abs_path(args.get("path", ""))
@@ -412,7 +420,8 @@ class GenericAgentHandler(BaseHandler):
                            count=count, show_linenos=show_linenos)
         if show_linenos and not result.startswith("Error:"): result = '由于设置了show_linenos，以下返回信息为：(行号|)内容 。\n' + result 
         if ' ... [TRUNCATED]' in result: result += '\n\n（某些行被截断，如需完整内容可改用 code_run 读取）'
-        result = smart_format(result, max_str_len=20000, omit_str='\n\n[omitted long content]\n\n')
+        maxlen = 15000 // args.get('_tool_num', 1)
+        result = smart_format(result, max_str_len=maxlen, omit_str='\n\n[omitted long content]\n\n')
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         log_memory_access(path)
         if 'memory' in path or 'sop' in path: 
@@ -423,7 +432,8 @@ class GenericAgentHandler(BaseHandler):
     def _exit_plan_mode(self): self.working.pop('in_plan_mode', None)
     def enter_plan_mode(self, plan_path): 
         self.working['in_plan_mode'] = plan_path; self.max_turns = 100
-        print(f"[Info] Entered plan mode with plan file: {plan_path}"); return plan_path
+        self.print(f"[Info] Entered plan mode with plan file: {plan_path}")
+        return plan_path
     def _check_plan_completion(self):
         if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
         try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
@@ -493,7 +503,7 @@ class GenericAgentHandler(BaseHandler):
             if remaining == 0:
                 self._exit_plan_mode(); yield "[Info] Plan完成：plan.md中0个[ ]残留，退出plan模式。\n"
         
-        yield "[Info] Final response to user.\n"
+        #yield "[Info] Final response to user.\n"
         return StepOutcome(response, next_prompt=None)
     
     def do_start_long_term_update(self, args, response):
@@ -525,7 +535,7 @@ class GenericAgentHandler(BaseHandler):
                 flush(); parts.append(line); cnt = 0; last = ''
             else: cnt += 1; last = line
         flush()
-        return "\n".join(parts[-150:])
+        return "\n".join(parts[-70:])
 
     def _get_anchor_prompt(self, skip=False):
         if skip: return "\n"
@@ -536,9 +546,7 @@ class GenericAgentHandler(BaseHandler):
         prompt += f"\nCurrent turn: {self.current_turn}\n"
         if self.working.get('key_info'): prompt += f"\n<key_info>{self.working.get('key_info')}</key_info>"
         if self.working.get('related_sop'): prompt += f"\n有不清晰的地方请再次读取{self.working.get('related_sop')}"
-        if getattr(self.parent, 'verbose', False):
-            try: print(prompt)
-            except: pass
+        if getattr(self.parent, 'verbose', False): self.print(prompt)
         return prompt
     
     def turn_end_callback(self, response, tool_calls, tool_results, turn, next_prompt, exit_reason):
@@ -551,11 +559,12 @@ class GenericAgentHandler(BaseHandler):
             summary = f"调用工具{tool_name}, args: {clean_args}"
             if tool_name == 'no_tool': summary = "直接回答了用户问题"
             next_prompt += "\n\n\n[SYSTEM] 必须在回复文本中包含<summary>！\n\n"
+            summary = smart_format(summary.replace('\n', ''), max_str_len=40)
         summary = smart_format(summary.replace('\n', ''), max_str_len=80)
         self.history_info.append(f'[Agent] {summary}')
         _plan = self._in_plan_mode()
 
-        if turn % 65 == 0 and (not _plan):
+        if turn % 75 == 0 and (not _plan):
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。必须总结情况进行ask_user，不允许继续重试。"
         elif turn % 7 == 0:
             next_prompt += f"\n\n[DANGER] 已连续执行第 {turn} 轮。禁止无效重试。若无有效进展，必须切换策略：1. 探测物理边界 2. 请求用户协助。如有需要，可调用 update_working_checkpoint 保存关键上下文。"
@@ -563,13 +572,13 @@ class GenericAgentHandler(BaseHandler):
 
         if _plan and turn >= 10 and turn % 5 == 0:
             next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
-        if _plan and turn >= 90: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
+        if _plan and turn >= 120: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
         injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
         injprompt = consume_file(self.parent.task_dir, '_intervene')
         if injkeyinfo: self.working['key_info'] = self.working.get('key_info', '') + f"\n[MASTER] {injkeyinfo}"
         if injprompt: next_prompt += f"\n\n[MASTER] {injprompt}\n"
-        for hook in getattr(self.parent, '_turn_end_hooks', {}).values(): hook(locals())  # current readonly
+        for hook in list(getattr(self.parent, '_turn_end_hooks', {}).values()): hook(locals())  # current readonly
         return next_prompt
 
 def get_global_memory():
